@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# gib-eimza: run GİB's e-imza signing app (EFatura Web Socket) for
+# earsivportal.efatura.gov.tr on Linux, without javaws.
+set -euo pipefail
+
+CODEBASE="https://ebelge.gib.gov.tr/EFaturaWebSocket"
+DATA_DIR="${GIB_EIMZA_DATA:-$HOME/.local/share/gib-eimza}"
+APP_DIR="$DATA_DIR/app"
+PKCS11_LIB="/usr/lib/libakisp11.so"
+PORT=8543
+VERSION="1.0.0"
+# SHA-256 fingerprints of the certificates GİB signs its jars with. Downloaded
+# jars signed by anything else are rejected. The current one is
+# CN=Gelir İdaresi Başkanlığı, issued by GlobalSign GCC R45 CodeSigning CA 2020,
+# valid until 2027-08-28. To accept another certificate that you have checked
+# yourself, set GIB_EIMZA_SIGNER to its fingerprint.
+GIB_SIGNERS="7C31050B7685F0869884D28D3535D779EF570FC3B3A524B39097F0A7EA51ACFA${GIB_EIMZA_SIGNER:+,$GIB_EIMZA_SIGNER}"
+
+usage() {
+  cat <<EOF
+Usage: gib-eimza [command]
+
+  run      Start GİB's signing app (default). Keep it open while you use the portal.
+  update   Download or update GİB's signing app without starting it.
+  check    Check Java 8, pcscd, the AKİS driver and your card. Never uses your PIN.
+  java     Print the Java 8 that gib-eimza uses.
+  version  Print the version of gib-eimza.
+EOF
+}
+
+notify() {
+  # Started from the app menu: there is no terminal to show messages in.
+  [ -t 2 ] || notify-send -i "$1" "GİB e-İmza" "$2" 2>/dev/null || true
+}
+
+die() {
+  echo "gib-eimza: $*" >&2
+  notify dialog-error "$*"
+  exit 1
+}
+
+# Java 8 is required: GİB's signer creates the PKCS#11 provider through
+# SunPKCS11(InputStream), a constructor that Java 9 removed.
+is_java8() {
+  [ -x "$1" ] && [[ "$("$1" -version 2>&1)" == *'version "1.8.'* ]]
+}
+
+find_java() {
+  local java
+  if [ -n "${JAVA:-}" ]; then
+    if is_java8 "$JAVA"; then echo "$JAVA"; return 0; fi
+    echo "gib-eimza: JAVA=$JAVA is not an executable Java 8." >&2
+    return 1
+  fi
+  if [ -n "${JAVA_HOME:-}" ] && is_java8 "$JAVA_HOME/bin/java"; then echo "$JAVA_HOME/bin/java"; return 0; fi
+  # Debian/Ubuntu, Arch, Fedora, Adoptium Temurin, Amazon Corretto, Azul Zulu.
+  for java in \
+      /usr/lib/jvm/java-8-openjdk*/jre/bin/java \
+      /usr/lib/jvm/java-1.8.0*/jre/bin/java \
+      /usr/lib/jvm/jre-1.8.0*/bin/java \
+      /usr/lib/jvm/temurin-8-*/bin/java \
+      /usr/lib/jvm/zulu*8*/jre/bin/java \
+      /usr/lib/jvm/zulu*8*/bin/java; do
+    if is_java8 "$java"; then echo "$java"; return 0; fi
+  done
+  return 1
+}
+
+need_java() {
+  JAVA_BIN=$(find_java) || die "Java 8 not found. Run install.sh, or set JAVA=/path/to/java8/bin/java."
+}
+
+app_running() {
+  [ -n "$(ss -Hltn "sport = :$PORT" 2>/dev/null)" ]
+}
+
+# Reads the jar list and the main class of a JNLP file into JARS and MAIN.
+# Fails when the file does not look like GİB's JNLP.
+parse_jnlp() {
+  local file=$1 jar mains=()
+  # Tags may span lines, so join the file first. Attribute order does not matter.
+  mapfile -t JARS < <(tr -s '[:space:]' ' ' < "$file" | grep -o '<jar [^>]*>' | sed -n 's/.*href="\([^"]*\)".*/\1/p')
+  mapfile -t mains < <(tr -s '[:space:]' ' ' < "$file" | grep -o '<application-desc [^>]*>' | sed -n 's/.*main-class="\([^"]*\)".*/\1/p')
+  MAIN=${mains[0]:-}
+  [ "${#JARS[@]}" -gt 0 ] && [ -n "$MAIN" ] || return 1
+  for jar in "${JARS[@]}"; do
+    # Jar paths become file names under APP_DIR and URLs under CODEBASE.
+    case "$jar" in ..|../*|*/..|*/../*|/*|*://*) return 1 ;; esac
+  done
+  return 0
+}
+
+# Downloads one jar listed in the JNLP into $jar.part when we have no copy or
+# GİB's copy is newer, and leaves no .part behind otherwise. Never touches
+# $jar itself: that happens after verification.
+refresh_jar() {
+  local jar=$1
+  mkdir -p "$(dirname "$jar")"
+  rm -f "$jar.part"
+  if [ ! -f "$jar" ]; then
+    echo "  $jar"
+    if ! curl -fsS -R -o "$jar.part" "$CODEBASE/$jar"; then
+      rm -f "$jar.part"
+      echo "Could not download $CODEBASE/$jar" >&2
+      return 1
+    fi
+  # With -z, curl writes nothing when our copy is current. Quiet (-s without
+  # -S): many of these run at once, and the message below says enough.
+  elif ! curl -fs -R -z "$jar" -o "$jar.part" "$CODEBASE/$jar"; then
+    rm -f "$jar.part"
+    echo "Could not check $jar for updates; using the cached copy." >&2
+  elif [ ! -s "$jar.part" ]; then
+    rm -f "$jar.part"
+  fi
+}
+
+# Checks downloaded jars before they replace anything: every entry must be
+# signed by one of the certificates in GIB_SIGNERS. Uses the JRE's own jar
+# verifier through jjs, so no JDK is needed.
+verify_jars() {
+  local jjs script rc=0
+  jjs="$(dirname "$JAVA_BIN")/jjs"
+  [ -x "$jjs" ] || die "cannot verify GİB's jars: $jjs not found. Install a full Java 8 runtime."
+  script=$(mktemp --suffix=.js)
+  cat > "$script" <<'EOF'
+var JarFile = Java.type("java.util.jar.JarFile");
+var MessageDigest = Java.type("java.security.MessageDigest");
+var pins = arguments[0].toUpperCase().replace(/[^0-9A-F,]/g, "").split(",");
+var buffer = new (Java.type("byte[]"))(65536);
+
+function hex(bytes) { var s = ""; for each (var b in bytes) s += ("0" + (b & 0xff).toString(16)).slice(-2); return s.toUpperCase(); }
+function fingerprint(cert) { return hex(MessageDigest.getInstance("SHA-256").digest(cert.getEncoded())); }
+function cn(dn) { var m = /CN=([^,]+)/.exec(dn); return m ? m[1] : "(no CN)"; }
+function colons(fp) { return fp.replace(/(..)(?=.)/g, "$1:"); }
+
+var failed = 0;
+for (var i = 1; i < arguments.length; i++) {
+    var path = arguments[i], problem = null, signers = {};
+    try {
+        var jar = new JarFile(path, true);
+        var entries = jar.entries();
+        while (entries.hasMoreElements()) {
+            var entry = entries.nextElement();
+            if (entry.isDirectory()) continue;
+            var stream = jar.getInputStream(entry);
+            while (stream.read(buffer) != -1) {}   // reading verifies the entry against the signed manifest
+            stream.close();
+            if (/^META-INF\/(MANIFEST\.MF|[^\/]+\.(SF|RSA|DSA|EC))$/i.test(entry.getName())) continue;
+            var codeSigners = entry.getCodeSigners(), pinned = false;
+            if (codeSigners == null) { problem = "unsigned entry " + entry.getName(); break; }
+            for each (var signer in codeSigners) {
+                var cert = signer.getSignerCertPath().getCertificates().get(0);
+                var fp = fingerprint(cert);
+                signers[fp] = cn(cert.getSubjectX500Principal().getName());
+                if (pins.indexOf(fp) >= 0) pinned = true;
+            }
+            if (!pinned) { problem = entry.getName() + " is not signed by a pinned certificate"; break; }
+        }
+        jar.close();
+    } catch (e) {
+        problem = "" + e;
+    }
+    if (problem) {
+        failed++;
+        print("  [!!] " + path + ": " + problem);
+        for (var fp in signers) print("       signed by " + signers[fp] + ", SHA-256 " + colons(fp));
+    }
+}
+if (failed > 0) exit(1);
+EOF
+  "$jjs" "$script" -- "$GIB_SIGNERS" "$@" || rc=$?
+  rm -f "$script"
+  return "$rc"
+}
+
+# Downloads the jars in JARS that are missing or outdated and installs them
+# once they are all verified. Fails without replacing anything otherwise.
+fetch_jars() {
+  local jar pid pids=() parts=() ok=1
+  for jar in "${JARS[@]}"; do
+    if [ ! -f "$jar" ]; then
+      echo "Downloading GİB's signing app files. GİB's server is slow; this can take a few minutes."
+      notify dialog-information "Downloading GİB's signing app. This can take a few minutes."
+      break
+    fi
+  done
+  # In parallel: GİB's server is slow per request.
+  for jar in "${JARS[@]}"; do
+    refresh_jar "$jar" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || ok=0
+  done
+  for jar in "${JARS[@]}"; do
+    if [ -f "$jar.part" ]; then parts+=("$jar.part"); fi
+  done
+  if [ "$ok" = 1 ] && [ "${#parts[@]}" -gt 0 ] && ! verify_jars "${parts[@]}"; then
+    echo "The downloaded files are not GİB's signed app. Behind a captive portal or a proxy, log in to it first; otherwise see the Security notes in README.md." >&2
+    ok=0
+  fi
+  if [ "$ok" = 0 ]; then
+    if [ "${#parts[@]}" -gt 0 ]; then rm -f "${parts[@]}"; fi
+    return 1
+  fi
+  for jar in "${JARS[@]}"; do
+    if [ -f "$jar.part" ]; then
+      if [ -f "$jar" ]; then echo "  updated $jar"; fi
+      mv "$jar.part" "$jar"
+    fi
+  done
+  return 0
+}
+
+# GİB renames jars now and then. Removes the jars that the JNLP no longer
+# lists. Runs right after a new JNLP is installed, so the cached app stays
+# complete.
+prune_jars() {
+  local file jar keep
+  while IFS= read -r -d '' file; do
+    file=${file#./}
+    keep=0
+    for jar in "${JARS[@]}"; do
+      if [ "$file" = "$jar" ]; then keep=1; break; fi
+    done
+    if [ "$keep" = 0 ]; then
+      rm -f "$file"
+      echo "  removed $file"
+    fi
+  done < <(find . -type f -name '*.jar' -print0)
+}
+
+# Fetches GİB's current JNLP and the jars it lists. Falls back to the cached
+# app when GİB can't be reached or the download fails verification.
+# Sets JARS, MAIN and CHECKED (1 when GİB's current version is installed).
+update_app() {
+  mkdir -p "$APP_DIR"
+  cd "$APP_DIR"
+  CHECKED=0
+  if curl -fsS -o EFaturaWebSocket.jnlp.new "$CODEBASE/EFaturaWebSocket.jnlp"; then
+    if parse_jnlp EFaturaWebSocket.jnlp.new; then
+      if fetch_jars; then
+        mv EFaturaWebSocket.jnlp.new EFaturaWebSocket.jnlp
+        prune_jars
+        CHECKED=1
+        return 0
+      fi
+    else
+      echo "The JNLP from GİB could not be parsed. Either something else answered (a captive portal or a proxy?), or GİB changed its format and gib-eimza-linux needs an update." >&2
+    fi
+    rm -f EFaturaWebSocket.jnlp.new
+  else
+    rm -f EFaturaWebSocket.jnlp.new
+    echo "Could not reach GİB to check for updates." >&2
+  fi
+
+  # Fall back to the cached app. Jars are only pruned right after a new JNLP
+  # is installed, so the jars of the cached JNLP are still there.
+  [ -f EFaturaWebSocket.jnlp ] || die "could not download GİB's signing app from $CODEBASE"
+  parse_jnlp EFaturaWebSocket.jnlp || die "the cached $APP_DIR/EFaturaWebSocket.jnlp is unusable; run \"gib-eimza update\" when GİB is reachable"
+  local jar
+  for jar in "${JARS[@]}"; do
+    rm -f "$jar.part"
+    [ -f "$jar" ] || die "could not download GİB's signing app from $CODEBASE"
+  done
+  echo "Using the cached app." >&2
+}
+
+run_app() {
+  need_java
+  # One instance at a time. Java inherits fd 9, so the lock is held until the
+  # app exits. The port check also catches an app started some other way.
+  mkdir -p "$DATA_DIR"
+  exec 9>"$DATA_DIR/lock"
+  if ! flock -n 9 || app_running; then
+    echo "The signing app is already running (or still starting)."
+    notify dialog-information "The signing app is already running."
+    exit 0
+  fi
+  if [ ! -f "$PKCS11_LIB" ]; then
+    echo "Warning: $PKCS11_LIB is missing, so card login will fail. Run install.sh." >&2
+    notify dialog-warning "The AKİS driver is missing, so card login will fail. Run install.sh."
+  fi
+
+  update_app
+  local classpath
+  classpath=$(IFS=:; echo "${JARS[*]}")
+
+  # Started from a snap's terminal (e.g. VS Code)? Drop its GTK overrides: they
+  # make Java's GTK look-and-feel load the snap's own libraries and crash.
+  if [ -n "${SNAP:-}" ]; then
+    unset GTK_PATH GTK_EXE_PREFIX GTK_IM_MODULE_FILE GDK_PIXBUF_MODULE_FILE \
+          GDK_PIXBUF_MODULEDIR GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR LOCPATH
+  fi
+
+  echo "Starting the signing app. Keep its window open while you use earsivportal."
+  echo "Its log is in /tmp/EFaturaWebSocketLog/."
+  # JVM options as in the JNLP's <j2se> element, plus:
+  # Ubuntu's Java 8 enables the GNOME ATK bridge, which isn't installed and breaks Swing.
+  exec "$JAVA_BIN" \
+    -Xms512m -Xmx2048m \
+    -XX:+UseG1GC \
+    -XX:+HeapDumpOnOutOfMemoryError \
+    -XX:HeapDumpPath="$DATA_DIR/heapdump.hprof" \
+    -Dfile.encoding=UTF-8 \
+    -Djavax.accessibility.assistive_technologies= \
+    -cp "$classpath" "$MAIN"
+}
+
+# Lists readers, cards and certificates through the AKİS PKCS#11 library.
+# Read-only: it never calls C_Login, so it uses no PIN attempts.
+card_check() {
+  local jjs script rc=0
+  jjs="$(dirname "$1")/jjs"
+  if [ ! -x "$jjs" ]; then
+    echo "  [--] Skipping the card check: $jjs not found"
+    return 0
+  fi
+  script=$(mktemp --suffix=.js)
+  cat > "$script" <<'EOF'
+var PKCS11 = Java.type("sun.security.pkcs11.wrapper.PKCS11");
+var CK_ATTRIBUTE = Java.type("sun.security.pkcs11.wrapper.CK_ATTRIBUTE");
+var CertificateFactory = Java.type("java.security.cert.CertificateFactory");
+var ByteArrayInputStream = Java.type("java.io.ByteArrayInputStream");
+var JString = Java.type("java.lang.String");
+var dateFormat = new java.text.SimpleDateFormat("yyyy-MM-dd");
+
+// The AKİS library pads with NUL rather than spaces, and a JS trim() keeps NUL.
+function text(chars) { return String(new JString(chars)).replace(/[\s\u0000]+$/, ""); }
+// Only the CN: the rest of the subject holds the TC kimlik number.
+function cn(dn) { var m = /CN=([^,]+)/.exec(dn); return m ? m[1] : "(no CN)"; }
+function attributes(list) { return Java.to(list, "sun.security.pkcs11.wrapper.CK_ATTRIBUTE[]"); }
+
+// Token flags are not reported: the AKİS library sets CKF_USER_PIN_LOCKED
+// even when the PIN works.
+var problems = 0, cards = 0;
+try {
+    var p11 = PKCS11.getInstance(arguments[0], "C_GetFunctionList", null, false);
+    var slots = p11.C_GetSlotList(false);
+    if (slots.length == 0) {
+        print("  [!!] No card reader found. Plug in your e-imza token.");
+        problems++;
+    }
+    for each (var slot in slots) {
+        var slotInfo = p11.C_GetSlotInfo(slot);
+        if ((slotInfo.flags & 0x1 /* CKF_TOKEN_PRESENT */) == 0) {
+            print("  [--] Reader without a card: " + text(slotInfo.slotDescription));
+            continue;
+        }
+        cards++;
+        print("  [ok] Card " + text(p11.C_GetTokenInfo(slot).model) + " in " + text(slotInfo.slotDescription));
+
+        var session = p11.C_OpenSession(slot, 4 /* CKF_SERIAL_SESSION */, null, null);
+        p11.C_FindObjectsInit(session, attributes([new CK_ATTRIBUTE(0 /* CKA_CLASS */, 1 /* CKO_CERTIFICATE */)]));
+        var objects = p11.C_FindObjects(session, 20);
+        p11.C_FindObjectsFinal(session);
+        if (objects.length == 0) {
+            print("  [!!] No certificates on this card.");
+            problems++;
+        }
+        for each (var object in objects) {
+            var value = attributes([new CK_ATTRIBUTE(0x11 /* CKA_VALUE */)]);
+            p11.C_GetAttributeValue(session, object, value);
+            var cert = CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(value[0].getByteArray()));
+            var keyUsage = cert.getKeyUsage();
+            var notes = "";
+            if (keyUsage == null || !keyUsage[1] /* nonRepudiation */) notes += " (not a signing certificate)";
+            if (cert.getNotAfter().before(new java.util.Date())) { notes += " EXPIRED"; problems++; }
+            print("       Certificate: " + cn(cert.getSubjectX500Principal().getName())
+                  + ", issued by " + cn(cert.getIssuerX500Principal().getName())
+                  + ", valid until " + dateFormat.format(cert.getNotAfter()) + notes);
+        }
+        p11.C_CloseSession(session);
+    }
+    if (slots.length > 0 && cards == 0) {
+        print("  [!!] No card detected. Re-plug your token.");
+        problems++;
+    }
+} catch (e) {
+    print("  [!!] Could not talk to the card: " + e);
+    problems++;
+}
+if (problems > 0) exit(1);
+EOF
+  "$jjs" "$script" -- "$PKCS11_LIB" || rc=$?
+  rm -f "$script"
+  return "$rc"
+}
+
+check() {
+  local java="" failed=0
+  echo "Checking your e-imza setup (read-only; your PIN is not used):"
+
+  if java=$(find_java); then
+    echo "  [ok] Java 8: $java"
+  else
+    echo "  [!!] Java 8 not found. Run install.sh, or set JAVA=/path/to/java8/bin/java."
+    failed=1
+  fi
+
+  if systemctl is-active --quiet pcscd.socket || systemctl is-active --quiet pcscd.service; then
+    echo "  [ok] Smart card service (pcscd) is running"
+  else
+    echo "  [!!] pcscd is not running. Run: sudo systemctl enable --now pcscd.socket"
+    failed=1
+  fi
+
+  if [ -f "$PKCS11_LIB" ]; then
+    echo "  [ok] AKİS driver: $PKCS11_LIB"
+    if [ -n "$java" ]; then card_check "$java" || failed=1; fi
+  else
+    echo "  [!!] AKİS driver $PKCS11_LIB is missing. Run install.sh."
+    failed=1
+  fi
+
+  if app_running; then
+    echo "  [ok] The signing app is running"
+  else
+    echo "  [--] The signing app is not running. Start it with: gib-eimza"
+  fi
+
+  if [ "$failed" = 0 ]; then
+    echo "Everything looks good."
+  else
+    echo "Some checks failed. See the Troubleshooting section of the README."
+    return 1
+  fi
+}
+
+case "${1:-run}" in
+  run) run_app ;;
+  update)
+    need_java
+    update_app
+    if [ "$CHECKED" = 1 ]; then
+      echo "GİB's signing app is up to date."
+    else
+      echo "Could not check for updates; the cached app was kept." >&2
+    fi ;;
+  check) check ;;
+  java) find_java || die "Java 8 not found. Run install.sh, or set JAVA=/path/to/java8/bin/java." ;;
+  version|--version|-V) echo "gib-eimza $VERSION" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
